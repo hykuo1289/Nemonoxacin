@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>小丑魚對抗細菌大作戰 (Nemonoxacin)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <style>
+        body, html { margin: 0; padding: 0; overflow: hidden; background-color: #000; touch-action: none; }
+        canvas { display: block; }
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        .pointer-events-auto { pointer-events: auto; }
+        
+        /* 沖水特效 */
+        #water-flush {
+            position: absolute;
+            top: -100%;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(to bottom, rgba(0, 150, 255, 0.8), rgba(0, 200, 255, 0.9));
+            transition: top 1.5s ease-in-out;
+            z-index: 10;
+        }
+        .flush-active { top: 100% !important; }
+    </style>
+</head>
+<body>
+
+    <canvas id="gameCanvas"></canvas>
+    
+    <!-- 沖水動畫圖層 -->
+    <div id="water-flush"></div>
+
+    <!-- UI 介面 -->
+    <div id="ui-layer" class="flex flex-col justify-between p-4">
+        <div class="flex justify-between items-start">
+            <div class="text-white text-xl font-bold drop-shadow-md bg-black/50 px-3 py-1 rounded">
+                分數: <span id="scoreDisplay">0</span><br>
+                血量: <span id="healthDisplay">100</span>
+            </div>
+        </div>
+
+        <div id="startScreen" class="absolute inset-0 bg-black/80 flex flex-col items-center justify-center pointer-events-auto z-20">
+            <h1 class="text-3xl text-white font-bold mb-4 text-center">Nemonoxacin<br>小丑魚對抗細菌</h1>
+            <p class="text-white text-center mb-6 px-4">
+                滑動螢幕控制小丑魚。<br>
+                吃掉鏈球菌、葡萄球菌、大腸桿菌得分！<br>
+                <span class="text-red-400">注意：碰到綠色的「綠膿桿菌」會扣血！</span>
+            </p>
+            <button id="startBtn" class="px-6 py-3 bg-blue-500 text-white font-bold rounded-full text-xl shadow-lg active:scale-95">開始遊戲</button>
+        </div>
+
+        <!-- 遊戲結束/破關按鈕 -->
+        <div class="flex justify-center mb-8 pointer-events-auto z-20">
+            <button id="antibioticBtn" class="hidden px-6 py-4 bg-blue-600 text-white font-bold rounded-xl text-lg shadow-xl shadow-blue-900/50 active:scale-95 border-2 border-white animate-pulse">
+                呼叫對抗綠膿桿菌的抗生素
+            </button>
+        </div>
+        
+        <div id="gameOverScreen" class="hidden absolute inset-0 bg-black/80 flex flex-col items-center justify-center pointer-events-auto z-20">
+            <h1 id="gameOverTitle" class="text-4xl text-white font-bold mb-4 text-center">任務完成！</h1>
+            <p id="gameOverText" class="text-white text-xl text-center mb-6 px-4">腳部已經恢復健康！</p>
+            <button id="restartBtn" class="px-6 py-3 bg-green-500 text-white font-bold rounded-full text-xl shadow-lg active:scale-95">重新開始</button>
+        </div>
+    </div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    
+    // UI 元素
+    const scoreDisplay = document.getElementById('scoreDisplay');
+    const healthDisplay = document.getElementById('healthDisplay');
+    const startScreen = document.getElementById('startScreen');
+    const startBtn = document.getElementById('startBtn');
+    const antibioticBtn = document.getElementById('antibioticBtn');
+    const gameOverScreen = document.getElementById('gameOverScreen');
+    const gameOverTitle = document.getElementById('gameOverTitle');
+    const gameOverText = document.getElementById('gameOverText');
+    const restartBtn = document.getElementById('restartBtn');
+    const waterFlush = document.getElementById('water-flush');
+
+    let width, height;
+    let score = 0;
+    let health = 100;
+    let gameActive = false;
+    let isHealthy = false;
+    
+    // 音效合成器 (Tone.js)
+    let synth, metalSynth, winSynth;
+
+    // 遊戲物件
+    let player = { x: 0, y: 0, targetX: 0, targetY: 0, radius: 20 };
+    let bacterias = [];
+
+    // 初始化尺寸
+    function resize() {
+        width = window.innerWidth;
+        height = window.innerHeight;
+        canvas.width = width;
+        canvas.height = height;
+        // 放大主角尺寸為螢幕寬度的 10% (原本兩倍)
+        player.radius = width * 0.1;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // 音效設定
+    async function initAudio() {
+        await Tone.start();
+        synth = new Tone.Synth().toDestination();
+        metalSynth = new Tone.MetalSynth({ envelope: { attack: 0.01, decay: 0.1, release: 0.01 } }).toDestination();
+        winSynth = new Tone.PolySynth(Tone.Synth).toDestination();
+    }
+
+    function playSound(type) {
+        if (!synth) return;
+        if (type === 'eat') synth.triggerAttackRelease("C5", "16n");
+        if (type === 'hurt') metalSynth.triggerAttackRelease("32n");
+        if (type === 'flush') winSynth.triggerAttackRelease(["C4", "E4", "G4", "C5"], "1n");
+    }
+
+    // 畫小丑魚
+    function drawPlayer() {
+        ctx.save();
+        ctx.translate(player.x, player.y);
+        
+        // 根據移動方向翻轉
+        if (player.targetX < player.x) ctx.scale(-1, 1);
+
+        // 魚身體 (橘色橢圓)
+        ctx.fillStyle = '#FF7F00';
+        ctx.beginPath();
+        ctx.ellipse(0, 0, player.radius, player.radius * 0.6, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#000';
+        ctx.stroke();
+
+        // 白色條紋
+        ctx.fillStyle = '#FFF';
+        ctx.beginPath();
+        ctx.ellipse(-player.radius * 0.3, 0, player.radius * 0.2, player.radius * 0.55, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        
+        ctx.beginPath();
+        ctx.ellipse(player.radius * 0.3, 0, player.radius * 0.2, player.radius * 0.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        // 眼睛
+        ctx.fillStyle = '#FFF';
+        ctx.beginPath();
+        ctx.arc(player.radius * 0.6, -player.radius * 0.2, player.radius * 0.15, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#000';
+        ctx.beginPath();
+        ctx.arc(player.radius * 0.65, -player.radius * 0.2, player.radius * 0.05, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 尾巴
+        ctx.fillStyle = '#FF7F00';
+        ctx.beginPath();
+        ctx.moveTo(-player.radius, 0);
+        ctx.lineTo(-player.radius * 1.5, -player.radius * 0.4);
+        ctx.lineTo(-player.radius * 1.5, player.radius * 0.4);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.restore();
+    }
+
+    // 畫細菌
+    function drawBacteria(b) {
+        ctx.save();
+        ctx.translate(b.x, b.y);
+        ctx.rotate(b.rotation);
+
+        if (b.type === 'strep') {
+            // 鏈球菌：黑色五顆排成一列
+            ctx.fillStyle = '#222';
+            let r = b.size / 2.5;
+            for(let i = -2; i <= 2; i++) {
+                ctx.beginPath();
+                ctx.arc(i * r * 1.8, 0, r, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        } else if (b.type === 'staph') {
+            // 葡萄球菌：金色葡萄狀 (上1,中2,下3)
+            ctx.fillStyle = '#FFD700'; // 金黃色
+            let r = b.size / 2.5;
+            // 上1
+            ctx.beginPath(); ctx.arc(0, -r*1.5, r, 0, Math.PI*2); ctx.fill();
+            // 中2
+            ctx.beginPath(); ctx.arc(-r, 0, r, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.arc(r, 0, r, 0, Math.PI*2); ctx.fill();
+            // 下3
+            ctx.beginPath(); ctx.arc(-r*1.8, r*1.5, r, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.arc(0, r*1.5, r, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.arc(r*1.8, r*1.5, r, 0, Math.PI*2); ctx.fill();
+        } else if (b.type === 'ecoli') {
+            // 大腸桿菌：紅色胖胖桿狀
+            ctx.fillStyle = '#E53E3E';
+            let w = b.size * 2.5;
+            let h = b.size * 1.2;
+            ctx.beginPath();
+            ctx.roundRect(-w/2, -h/2, w, h, h/2);
+            ctx.fill();
+        } else if (b.type === 'pseudo') {
+            // 綠膿桿菌：綠色細長桿狀
+            ctx.fillStyle = '#48BB78';
+            let w = b.size * 3.5;
+            let h = b.size * 0.7;
+            ctx.beginPath();
+            ctx.roundRect(-w/2, -h/2, w, h, h/2);
+            ctx.fill();
+        }
+        ctx.restore();
+    }
+
+    // 產生細菌
+    function spawnBacterias() {
+        bacterias = [];
+        // 增加細菌總數：將畫面面積除以較小的數值
+        const baseCount = Math.floor((width * height) / 10000); 
+        
+        for (let i = 0; i < baseCount; i++) {
+            let rand = Math.random();
+            let type = 'strep';
+            if (rand > 0.8) type = 'pseudo';       // 約20%綠膿桿菌
+            else if (rand > 0.5) type = 'ecoli';   // 約30%大腸桿菌
+            else if (rand > 0.2) type = 'staph';   // 約30%葡萄球菌
+            
+            bacterias.push({
+                x: Math.random() * width,
+                y: Math.random() * height,
+                type: type,
+                size: Math.random() * 8 + 6,
+                rotation: Math.random() * Math.PI * 2,
+                vx: (Math.random() - 0.5) * 1,
+                vy: (Math.random() - 0.5) * 1,
+                isHarmful: type === 'pseudo'
+            });
+        }
+    }
+
+    // 畫背景 (腳部)
+    function drawBackground() {
+        if (isHealthy) {
+            // 健康的腳背景 (膚色漸層)
+            let grad = ctx.createRadialGradient(width/2, height/2, 0, width/2, height/2, width);
+            grad.addColorStop(0, '#f5d0b5');
+            grad.addColorStop(1, '#e2b38f');
+            ctx.fillStyle = grad;
+        } else {
+            // 發炎紅腫的腳背景 (暗紅/紅色漸層)
+            let grad = ctx.createRadialGradient(width/2, height/2, 0, width/2, height/2, width);
+            grad.addColorStop(0, '#b91c1c'); // 紅腫中心
+            grad.addColorStop(1, '#450a0a'); // 邊緣暗沉
+            ctx.fillStyle = grad;
+        }
+        ctx.fillRect(0, 0, width, height);
+    }
+
+    // 遊戲主迴圈
+    function update() {
+        if (!gameActive) return;
+
+        // 平滑移動主角
+        player.x += (player.targetX - player.x) * 0.1;
+        player.y += (player.targetY - player.y) * 0.1;
+
+        drawBackground();
+
+        let nonGreenCount = 0;
+
+        // 更新與繪製細菌
+        for (let i = bacterias.length - 1; i >= 0; i--) {
+            let b = bacterias[i];
+            
+            // 漂浮移動
+            b.x += b.vx;
+            b.y += b.vy;
+            b.rotation += 0.01;
+            
+            // 邊界反彈
+            if (b.x < 0 || b.x > width) b.vx *= -1;
+            if (b.y < 0 || b.y > height) b.vy *= -1;
+
+            drawBacteria(b);
+
+            // 碰撞判定 (簡化為圓形距離判定)
+            let dx = player.x - b.x;
+            let dy = player.y - b.y;
+            let dist = Math.sqrt(dx*dx + dy*dy);
+            
+            let collisionDist = player.radius + b.size;
+
+            if (dist < collisionDist) {
+                if (b.isHarmful) {
+                    health -= 1;
+                    healthDisplay.innerText = health;
+                    if (health % 10 === 0) playSound('hurt');
+                    
+                    if (health <= 0) {
+                        endGame(false);
+                    }
+                } else {
+                    // 吃掉一般細菌
+                    score += 10;
+                    scoreDisplay.innerText = score;
+                    playSound('eat');
+                    bacterias.splice(i, 1);
+                    continue;
+                }
+            }
+
+            if (!b.isHarmful) nonGreenCount++;
+        }
+
+        drawPlayer();
+
+        // 檢查是否只剩下綠膿桿菌
+        if (nonGreenCount === 0 && bacterias.length > 0) {
+            antibioticBtn.classList.remove('hidden');
+        }
+
+        if (gameActive) requestAnimationFrame(update);
+    }
+
+    // 操作控制
+    canvas.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        player.targetX = e.touches[0].clientX;
+        player.targetY = e.touches[0].clientY;
+    });
+    canvas.addEventListener('mousemove', (e) => {
+        player.targetX = e.clientX;
+        player.targetY = e.clientY;
+    });
+
+    // 遊戲流程控制
+    startBtn.addEventListener('click', async () => {
+        await initAudio();
+        startScreen.classList.add('hidden');
+        resetGame();
+        gameActive = true;
+        update();
+    });
+
+    restartBtn.addEventListener('click', () => {
+        gameOverScreen.classList.add('hidden');
+        antibioticBtn.classList.add('hidden');
+        resetGame();
+        gameActive = true;
+        update();
+    });
+
+    // 抗生素按鈕特效
+    antibioticBtn.addEventListener('click', () => {
+        antibioticBtn.classList.add('hidden');
+        playSound('flush');
+        
+        // 觸發沖水特效
+        waterFlush.style.top = '-100%';
+        waterFlush.style.transition = 'top 1.5s ease-in-out';
+        
+        // 強制重繪以確保動畫生效
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                waterFlush.style.top = '100%';
+            });
+        });
+
+        // 動畫到一半時改變背景和清除細菌
+        setTimeout(() => {
+            isHealthy = true;
+            bacterias = []; // 清除所有綠膿桿菌
+            drawBackground();
+            drawPlayer();
+        }, 750);
+
+        // 動畫結束後顯示勝利
+        setTimeout(() => {
+            waterFlush.style.transition = 'none';
+            waterFlush.style.top = '-100%';
+            endGame(true);
+        }, 1600);
+    });
+
+    function resetGame() {
+        score = 0;
+        health = 100;
+        scoreDisplay.innerText = score;
+        healthDisplay.innerText = health;
+        isHealthy = false;
+        player.x = width / 2;
+        player.y = height / 2;
+        player.targetX = width / 2;
+        player.targetY = height / 2;
+        spawnBacterias();
+    }
+
+    function endGame(isWin) {
+        gameActive = false;
+        gameOverScreen.classList.remove('hidden');
+        if (isWin) {
+            gameOverTitle.innerText = "治療成功！";
+            gameOverTitle.className = "text-4xl text-green-400 font-bold mb-4 text-center";
+            gameOverText.innerText = "Nemonoxacin 成功消滅了綠膿桿菌，腳部恢復健康！";
+        } else {
+            gameOverTitle.innerText = "挑戰失敗";
+            gameOverTitle.className = "text-4xl text-red-500 font-bold mb-4 text-center";
+            gameOverText.innerText = "被綠膿桿菌感染太嚴重了...";
+        }
+    }
+
+    // 初始繪製背景
+    drawBackground();
+</script>
+</body>
+</html>
